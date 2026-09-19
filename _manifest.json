@@ -1,0 +1,45 @@
+{
+  "manifest_version": 2,
+  "id": "mai.gemini-transcribe-provider",
+  "version": "1.0.0",
+  "name": "Gemini Transcribe Provider",
+  "description": "MaiBot LLMProvider：通过 Google Files API + Interactions API 接入 gemini-3.5-transcribe；支持空结果诊断与 Flash-Lite fallback。",
+  "author": {
+    "name": "Mai Ooizumi",
+    "url": "https://github.com/Mai-Ooizumi/"
+  },
+  "license": "AGPL-3.0",
+  "urls": {
+    "repository": "https://github.com/Mai-Ooizumi/MaiBot-gemini-transcribe-provider"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.4.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "google-genai",
+      "version_spec": ">=2.24.0,<3.0.0"
+    }
+  ],
+  "capabilities": [],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "llm_providers": [
+    {
+      "client_type": "gemini35.transcribe",
+      "name": "Gemini 3.5 Transcribe",
+      "description": "Google Gemini 3.5 Transcribe ASR provider using Files + Interactions API",
+      "version": "1.0.0"
+    }
+  ]
+}

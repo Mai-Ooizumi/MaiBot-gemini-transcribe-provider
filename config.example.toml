@@ -1,0 +1,30 @@
+[gemini]
+# 推荐把 Key 放在 model_config.toml 的 api_provider.api_key；如果 Host 未向插件透传 Key，
+# 也可以填在这里，或者使用 GEMINI_API_KEY 环境变量。
+api_key = ""
+model = "gemini-3.5-transcribe"
+
+# verbatim = 尽量逐字转写；smart = 去口头禅、整理标点与结构。
+mode = "verbatim"
+
+# 留空表示自动语言检测；示例：language_codes = ["zh-CN", "en-US"]
+language_codes = []
+
+# 生僻词/人名/术语提示。开启说话人分离或词级时间戳时不要同时使用。
+custom_vocabulary = []
+
+# 对聊天语音通常保持 false；需要会议转写时可开启。
+speaker_diarization = false
+word_timestamps = false
+
+# 成功/失败后尽量删除 Files API 上传的临时文件。
+delete_uploaded_file = true
+
+# 仅用于本地 ffmpeg 转码的超时（秒）。
+ffmpeg_timeout = 45
+
+# 2026-09 已有公开案例显示 dedicated transcribe 可能 HTTP 200 但返回空文本。
+# 开启后，遇到这种“静默空结果”自动用普通 Gemini 音频理解模型做转写兜底。
+fallback_on_empty = true
+fallback_model = "gemini-3.5-flash-lite"
+fallback_prompt = "Generate an accurate transcript of the speech. Return only the transcript, with no commentary."
