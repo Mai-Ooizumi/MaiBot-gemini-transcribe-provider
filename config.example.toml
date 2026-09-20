@@ -4,6 +4,15 @@
 api_key = ""
 model = "gemini-3.5-transcribe"
 
+# 音频传输策略：auto 对小音频使用 Interactions inline Base64，大文件使用 Files API；
+# inline 强制 inline，files 强制 Files API。旧配置缺省时等价于 auto。
+audio_transport = "auto"
+# 保守的 inline 上限（字节）；聊天短语音通常远小于此值。
+inline_max_bytes = 262144
+
+# 仅对 WAV/专用 SILK 解码后的 PCM 做低成本高置信度静音过滤；不确定时继续请求 Gemini。
+local_speech_gate = true
+
 # verbatim = 尽量逐字转写；smart = 去口头禅、整理标点与结构。
 mode = "verbatim"
 

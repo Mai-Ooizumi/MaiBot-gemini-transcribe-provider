@@ -3,18 +3,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from google import genai
 from maibot_sdk import LLMProvider, MaiBotPlugin
+
+from audio import NormalizedAudio, detect_audio, is_clearly_silent, normalize_audio
+from gemini_client import GeminiClientPool
+from gemini_transport import extract_interaction_text, interaction_diagnostic, transcribe
 
 
 CLIENT_TYPE = "gemini35.transcribe"
 DEFAULT_MODEL = "gemini-3.5-transcribe"
+DEFAULT_INLINE_MAX_BYTES = 256 * 1024
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -32,75 +33,18 @@ def _as_str_list(value: Any) -> list[str]:
     return result
 
 
-def _detect_audio(data: bytes) -> tuple[str | None, str | None]:
-    """Return (mime_type, suffix). None means Google Transcribe may not accept it directly."""
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
-        return "audio/wav", ".wav"
-    if data.startswith(b"OggS"):
-        return "audio/ogg", ".ogg"
-    if data.startswith(b"fLaC"):
-        return "audio/flac", ".flac"
-    if data.startswith(b"ID3"):
-        return "audio/mpeg", ".mp3"
-    # AAC ADTS also starts with 0xFFF, so detect it before generic MPEG audio frames.
-    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xF6) == 0xF0:
-        return "audio/aac", ".aac"
-    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
-        return "audio/mpeg", ".mp3"
-    if data.startswith(b"FORM") and len(data) >= 12 and data[8:12] in {b"AIFF", b"AIFC"}:
-        return "audio/aiff", ".aiff"
-    if data.startswith(b"\x1aE\xdf\xa3"):
-        return "audio/webm", ".webm"
-    if len(data) >= 12 and data[4:8] == b"ftyp":
-        # M4A/MP4-family audio container. Use the MIME accepted by Gemini Transcribe.
-        return "audio/m4a", ".m4a"
-    if data.startswith(b"#!SILK_V3") or data.startswith(b"\x02#!SILK_V3"):
-        return None, ".silk"
-    if data.startswith(b"#!AMR\n") or data.startswith(b"#!AMR-WB\n"):
-        return None, ".amr"
-    return None, ".bin"
-
-
-def _convert_to_wav(src: Path, dst: Path, timeout: float) -> None:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError(
-            "收到的语音不是 Gemini 3.5 Transcribe 可直接接受的格式，而且系统没有找到 ffmpeg。"
-            "请安装 ffmpeg，或让上游 Adapter 输出 WAV/MP3/OGG/Opus/WebM。"
-        )
-    proc = subprocess.run(
-        [
-            ffmpeg,
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(src),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(dst),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=max(10.0, timeout),
-        check=False,
-    )
-    if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
-        detail = proc.stderr.decode("utf-8", errors="replace").strip()
-        if len(detail) > 1200:
-            detail = detail[-1200:]
-        raise RuntimeError(
-            "ffmpeg 无法把语音转换为 WAV。若这是 QQ/Tencent SILK，普通 ffmpeg 构建可能不带 SILK 解码器；"
-            "建议让 NapCat/Adapter 先转成 WAV/OGG/MP3。"
-            + (f" ffmpeg: {detail}" if detail else "")
-        )
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
 
 
 def _extract_api_key(request: dict[str, Any], settings: dict[str, Any]) -> str:
@@ -113,7 +57,6 @@ def _extract_api_key(request: dict[str, Any], settings: dict[str, Any]) -> str:
     config_key = str(gemini_cfg.get("api_key") or "").strip()
     if config_key:
         return config_key
-
     return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 
 
@@ -133,8 +76,8 @@ def _build_transcription_config(settings: dict[str, Any], request: dict[str, Any
     language_codes = _as_str_list(extra.get("language_codes", gemini_cfg.get("language_codes", [])))
     custom_vocabulary = _as_str_list(extra.get("custom_vocabulary", gemini_cfg.get("custom_vocabulary", [])))
     mode = str(extra.get("transcription_mode", gemini_cfg.get("mode", "verbatim"))).strip().lower() or "verbatim"
-    diarization = bool(extra.get("speaker_diarization", gemini_cfg.get("speaker_diarization", False)))
-    word_timestamps = bool(extra.get("word_timestamps", gemini_cfg.get("word_timestamps", False)))
+    diarization = _as_bool(extra.get("speaker_diarization", gemini_cfg.get("speaker_diarization", False)), False)
+    word_timestamps = _as_bool(extra.get("word_timestamps", gemini_cfg.get("word_timestamps", False)), False)
 
     if mode not in {"verbatim", "smart"}:
         raise ValueError("gemini.mode / transcription_mode 只能是 'verbatim' 或 'smart'")
@@ -148,7 +91,6 @@ def _build_transcription_config(settings: dict[str, Any], request: dict[str, Any
         config["language_codes"] = language_codes
     if custom_vocabulary:
         config["custom_vocabulary"] = custom_vocabulary[:1000]
-
     if mode == "smart":
         config["mode"] = "smart"
     elif diarization or word_timestamps:
@@ -158,169 +100,52 @@ def _build_transcription_config(settings: dict[str, Any], request: dict[str, Any
         if word_timestamps:
             mode_cfg["timestamp_granularities"] = ["word"]
         config["mode"] = mode_cfg
-    # For plain verbatim, omit mode: it is the API default.
     return config
 
 
-def _extract_interaction_text(interaction: Any) -> str:
-    """兼容 google-genai 不同版本的 Interactions 文本输出结构。"""
-    direct = str(getattr(interaction, "output_text", "") or "").strip()
-    if direct:
-        return direct
-
-    chunks: list[str] = []
-    for output in getattr(interaction, "outputs", []) or []:
-        if getattr(output, "type", None) == "text":
-            text = str(getattr(output, "text", "") or "").strip()
-            if text:
-                chunks.append(text)
-    if chunks:
-        return "\n".join(chunks).strip()
-
-    # 某些 SDK / API 版本把 model output 放在 steps[].content[] 中。
-    for step in getattr(interaction, "steps", []) or []:
-        for content in getattr(step, "content", []) or []:
-            if getattr(content, "type", None) == "text":
-                text = str(getattr(content, "text", "") or "").strip()
-                if text:
-                    chunks.append(text)
-    return "\n".join(chunks).strip()
-
-
-def _interaction_diagnostic(interaction: Any) -> str:
-    """只输出无敏感信息的响应摘要，便于定位 Google 的静默空结果。"""
-    status = str(getattr(interaction, "status", "") or "unknown")
-    interaction_id = str(getattr(interaction, "id", "") or "")
-
-    output_types: list[str] = []
-    for output in getattr(interaction, "outputs", []) or []:
-        output_types.append(str(getattr(output, "type", type(output).__name__)))
-
-    usage = getattr(interaction, "usage", None)
-    total_input = getattr(usage, "total_input_tokens", None) if usage is not None else None
-    total_output = getattr(usage, "total_output_tokens", None) if usage is not None else None
-
-    parts = [f"status={status}"]
-    if interaction_id:
-        parts.append(f"id={interaction_id}")
-    if total_input is not None:
-        parts.append(f"input_tokens={total_input}")
-    if total_output is not None:
-        parts.append(f"output_tokens={total_output}")
-    parts.append(f"output_types={output_types or []}")
-    return ", ".join(parts)
-
-
-def _fallback_transcription(
-    *,
-    client: Any,
-    uploaded: Any,
-    fallback_model: str,
-    prompt: str,
-) -> str:
-    response = client.models.generate_content(
-        model=fallback_model,
-        contents=[prompt, uploaded],
-    )
-    return str(getattr(response, "text", "") or "").strip()
-
-
-def _run_transcription(
-    *,
-    api_key: str,
-    model: str,
-    audio_path: Path,
-    mime_type: str,
-    transcription_config: dict[str, Any],
-    delete_uploaded_file: bool,
-    fallback_on_empty: bool,
-    fallback_model: str,
-    fallback_prompt: str,
-) -> tuple[str, str | None]:
-    client = genai.Client(api_key=api_key)
-    uploaded = None
-    try:
-        uploaded = client.files.upload(file=str(audio_path))
-        uploaded_mime = str(getattr(uploaded, "mime_type", "") or mime_type)
-        uploaded_uri = str(getattr(uploaded, "uri", "") or "")
-        if not uploaded_uri:
-            raise RuntimeError("Google Files API 上传成功但没有返回 file URI")
-
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "input": [
-                {
-                    "type": "audio",
-                    "uri": uploaded_uri,
-                    "mime_type": uploaded_mime,
-                }
-            ],
-        }
-        if transcription_config:
-            kwargs["generation_config"] = {"transcription_config": transcription_config}
-
-        interaction = client.interactions.create(**kwargs)
-        text = _extract_interaction_text(interaction)
-        if text:
-            return text, None
-
-        diagnostic = _interaction_diagnostic(interaction)
-        if fallback_on_empty and fallback_model:
-            fallback_text = _fallback_transcription(
-                client=client,
-                uploaded=uploaded,
-                fallback_model=fallback_model,
-                prompt=fallback_prompt,
-            )
-            if fallback_text:
-                return fallback_text, diagnostic
-            raise RuntimeError(
-                "Gemini 3.5 Transcribe 返回空结果，且 fallback 也为空。"
-                f" Dedicated response: {diagnostic}; fallback_model={fallback_model}"
-            )
-
-        raise RuntimeError(
-            "Gemini 3.5 Transcribe 返回了空转写结果。"
-            f" Google response summary: {diagnostic}"
+def _transport_settings(settings: dict[str, Any], request: dict[str, Any]) -> tuple[str, int, bool]:
+    gemini_cfg = _as_dict(settings.get("gemini"))
+    extra = _as_dict(request.get("extra_params"))
+    strategy = str(
+        extra.get(
+            "audio_transport",
+            extra.get("transport", gemini_cfg.get("audio_transport", gemini_cfg.get("transport", "auto"))),
         )
-    finally:
-        if delete_uploaded_file and uploaded is not None:
-            name = str(getattr(uploaded, "name", "") or "")
-            if name:
-                try:
-                    client.files.delete(name=name)
-                except Exception:
-                    # Cleanup failure must not discard a successful transcription.
-                    pass
-        try:
-            client.close()
-        except Exception:
-            pass
+        or "auto"
+    ).strip().lower()
+    try:
+        inline_max_bytes = int(
+            extra.get("inline_max_bytes", gemini_cfg.get("inline_max_bytes", DEFAULT_INLINE_MAX_BYTES))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("gemini.inline_max_bytes 必须是整数") from exc
+    local_speech_gate = _as_bool(extra.get("local_speech_gate", gemini_cfg.get("local_speech_gate", True)), True)
+    return strategy, inline_max_bytes, local_speech_gate
 
 
 class Gemini35TranscribePlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._settings: dict[str, Any] = {}
+        self._client_pool = GeminiClientPool()
 
     async def on_load(self) -> None:
-        # Runner 在 on_load() 前已注入插件自身 config.toml；直接读取本地配置快照，
-        # 不走 config.get_all capability RPC，避免无权限令牌时报 E_CAPABILITY_DENIED。
         self._settings = self.get_plugin_config_data()
         self.ctx.logger.info("Gemini 3.5 Transcribe Provider 已加载 (%s)", CLIENT_TYPE)
 
     async def on_unload(self) -> None:
-        return None
+        await self._client_pool.close()
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         del version
         if scope == "self":
             self._settings = dict(config_data)
+            await self._client_pool.invalidate()
 
     @LLMProvider(
         CLIENT_TYPE,
         name="Gemini 3.5 Transcribe",
-        description="通过 Google Files API + Interactions API 调用 gemini-3.5-transcribe",
+        description="通过 Interactions API 的 inline/files 音频输入调用 gemini-3.5-transcribe",
     )
     async def handle_llm_provider(self, operation: str, request: dict[str, Any]) -> dict[str, Any]:
         if operation != "audio_transcription":
@@ -336,6 +161,38 @@ class Gemini35TranscribePlugin(MaiBotPlugin):
         if not audio_bytes:
             raise ValueError("收到的音频为空")
 
+        gemini_cfg = _as_dict(self._settings.get("gemini"))
+        try:
+            timeout = float(gemini_cfg.get("ffmpeg_timeout", 45.0) or 45.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("gemini.ffmpeg_timeout 必须是数字") from exc
+        strategy, inline_max_bytes, local_speech_gate = _transport_settings(self._settings, request)
+
+        detected = detect_audio(audio_bytes)
+        if detected.mime_type:
+            audio = NormalizedAudio(
+                data=audio_bytes,
+                mime_type=detected.mime_type,
+                suffix=detected.suffix,
+                original_base64=audio_base64,
+            )
+        else:
+            # Decoder/transcoder work is local and blocking; API calls below use
+            # the SDK's native async client and never occupy this worker thread.
+            audio = await asyncio.to_thread(
+                normalize_audio,
+                audio_bytes,
+                timeout=timeout,
+                original_base64=audio_base64,
+            )
+
+        if local_speech_gate and is_clearly_silent(audio.data, audio.mime_type) is True:
+            self.ctx.logger.debug("本地 speech gate 过滤了明显静音音频")
+            return {
+                "content": "",
+                "raw_data": {"status": "no_speech", "reason": "local_speech_gate"},
+            }
+
         api_key = _extract_api_key(request, self._settings)
         if not api_key:
             raise RuntimeError(
@@ -347,10 +204,8 @@ class Gemini35TranscribePlugin(MaiBotPlugin):
         if model == "gemini-3.5-transcribe-live":
             raise ValueError("MaiBot 的 voice 是录音文件 ASR，请使用 gemini-3.5-transcribe，而不是 -live 模型")
 
-        gemini_cfg = _as_dict(self._settings.get("gemini"))
-        timeout = float(gemini_cfg.get("ffmpeg_timeout", 45.0) or 45.0)
-        delete_uploaded_file = bool(gemini_cfg.get("delete_uploaded_file", True))
-        fallback_on_empty = bool(gemini_cfg.get("fallback_on_empty", True))
+        delete_uploaded_file = _as_bool(gemini_cfg.get("delete_uploaded_file", True), True)
+        fallback_on_empty = _as_bool(gemini_cfg.get("fallback_on_empty", True), True)
         fallback_model = str(gemini_cfg.get("fallback_model", "gemini-3.5-flash-lite") or "").strip()
         fallback_prompt = str(
             gemini_cfg.get(
@@ -360,33 +215,26 @@ class Gemini35TranscribePlugin(MaiBotPlugin):
             or ""
         ).strip()
         transcription_config = _build_transcription_config(self._settings, request)
+        provider = _as_dict(request.get("api_provider"))
+        base_url = str(provider.get("base_url") or "").strip()
 
-        mime_type, suffix = _detect_audio(audio_bytes)
-        with tempfile.TemporaryDirectory(prefix="maibot-gemini35-asr-") as tmpdir:
-            tmp = Path(tmpdir)
-            source_path = tmp / f"input{suffix or '.bin'}"
-            source_path.write_bytes(audio_bytes)
-
-            upload_path = source_path
-            upload_mime = mime_type
-            if upload_mime is None:
-                wav_path = tmp / "converted.wav"
-                await asyncio.to_thread(_convert_to_wav, source_path, wav_path, timeout)
-                upload_path = wav_path
-                upload_mime = "audio/wav"
-
-            text, dedicated_diagnostic = await asyncio.to_thread(
-                _run_transcription,
-                api_key=api_key,
+        lease = await self._client_pool.acquire(api_key, base_url=base_url)
+        try:
+            text, dedicated_diagnostic = await transcribe(
+                client=lease.client,
+                audio=audio,
+                base64_data=audio.original_base64,
+                strategy=strategy,
+                inline_max_bytes=inline_max_bytes,
                 model=model,
-                audio_path=upload_path,
-                mime_type=upload_mime,
                 transcription_config=transcription_config,
                 delete_uploaded_file=delete_uploaded_file,
                 fallback_on_empty=fallback_on_empty,
                 fallback_model=fallback_model,
                 fallback_prompt=fallback_prompt,
             )
+        finally:
+            await lease.release()
 
         if dedicated_diagnostic is not None:
             self.ctx.logger.warning(
@@ -399,3 +247,20 @@ class Gemini35TranscribePlugin(MaiBotPlugin):
 
 def create_plugin() -> Gemini35TranscribePlugin:
     return Gemini35TranscribePlugin()
+
+
+# Compatibility wrapper for integrations/tests that imported the former helper.
+def _detect_audio(data: bytes) -> tuple[str | None, str | None]:
+    detected = detect_audio(data)
+    return detected.mime_type, detected.suffix
+
+
+def _convert_to_wav(src: Path, dst: Path, timeout: float) -> None:
+    """Compatibility wrapper for callers of the former path-based helper."""
+    from audio import _convert_with_ffmpeg
+
+    dst.write_bytes(_convert_with_ffmpeg(src.read_bytes(), src.suffix, timeout))
+
+
+_extract_interaction_text = extract_interaction_text
+_interaction_diagnostic = interaction_diagnostic

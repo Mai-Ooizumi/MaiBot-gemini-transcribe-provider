@@ -1,1 +1,2 @@
 google-genai>=2.24.0,<3.0.0
+pilk-nogil>=0.4.3,<0.5.0
