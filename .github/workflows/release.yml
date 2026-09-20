@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      draft:
+        description: Create the GitHub Release as a draft
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read manifest version and release notes
+        id: metadata
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          manifest_path = Path("_manifest.json")
+          changelog_path = Path("CHANGELOG.md")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          version = str(manifest.get("version", "")).strip()
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+              raise SystemExit(f"_manifest.json has an invalid release version: {version!r}")
+
+          provider_versions = {
+              str(item.get("version", "")).strip()
+              for item in manifest.get("llm_providers", [])
+              if isinstance(item, dict) and item.get("version") is not None
+          }
+          if provider_versions and provider_versions != {version}:
+              raise SystemExit(
+                  "_manifest.json top-level version and llm_providers versions must match: "
+                  f"top-level={version!r}, providers={sorted(provider_versions)!r}"
+              )
+
+          changelog = changelog_path.read_text(encoding="utf-8")
+          lines = changelog.splitlines()
+          heading = re.compile(rf"^## \[{re.escape(version)}\](?:\s+-.*)?$")
+          starts = [index for index, line in enumerate(lines) if heading.match(line)]
+          if len(starts) != 1:
+              raise SystemExit(
+                  f"CHANGELOG.md must contain exactly one heading for version {version}: found {len(starts)}"
+              )
+          start = starts[0]
+          end = next(
+              (index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")),
+              len(lines),
+          )
+          notes = "\n".join(lines[start + 1 : end]).strip()
+          if not notes:
+              raise SystemExit(f"CHANGELOG.md section for version {version} is empty")
+          Path("release-notes.md").write_text(notes + "\n", encoding="utf-8")
+
+          tag = f"v{version}"
+          archive_name = f"{manifest.get('id', 'plugin')}-{version}.zip"
+          archive_prefix = f"{manifest.get('id', 'plugin')}-{version}"
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"version={version}\n")
+              handle.write(f"tag={tag}\n")
+              handle.write(f"archive_name={archive_name}\n")
+              handle.write(f"archive_prefix={archive_prefix}\n")
+          PY
+
+      - name: Ensure the manifest version has not already been released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists; update _manifest.json before releasing again." >&2
+            exit 1
+          fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG} already exists; update _manifest.json before releasing again." >&2
+            exit 1
+          fi
+
+      - name: Build source archive
+        env:
+          ARCHIVE_NAME: ${{ steps.metadata.outputs.archive_name }}
+          ARCHIVE_PREFIX: ${{ steps.metadata.outputs.archive_prefix }}
+        shell: bash
+        run: git archive --format=zip --prefix="${ARCHIVE_PREFIX}/" --output="${ARCHIVE_NAME}" "${GITHUB_SHA}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          ARCHIVE_NAME: ${{ steps.metadata.outputs.archive_name }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          release_args=(--title "${TAG}" --notes-file release-notes.md --target "${GITHUB_SHA}")
+          if [[ "${DRAFT}" == "true" ]]; then
+            release_args+=(--draft)
+          fi
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${TAG}" "${ARCHIVE_NAME}" "${release_args[@]}"
