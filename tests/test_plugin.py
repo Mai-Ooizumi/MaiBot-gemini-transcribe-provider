@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import io
 import random
 import sys
@@ -9,11 +10,11 @@ import types
 import unittest
 import wave
 from pathlib import Path
+from uuid import uuid4
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
+PLUGIN_PATH = PLUGIN_DIR / "plugin.py"
 
 
 if "maibot_sdk" not in sys.modules:
@@ -39,9 +40,25 @@ if "maibot_sdk" not in sys.modules:
     sys.modules["maibot_sdk"] = sdk
 
 
-import audio
-import gemini_client
-import plugin
+def load_plugin_package(module_name: str):
+    """Load plugin.py exactly as MaiBot's package-style loader does."""
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        str(PLUGIN_PATH),
+        submodule_search_locations=[str(PLUGIN_DIR)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not build plugin import spec")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+PACKAGE_NAME = "test_maina_gemini_transcribe"
+plugin = load_plugin_package(PACKAGE_NAME)
+audio = sys.modules[f"{PACKAGE_NAME}.audio"]
+gemini_client = sys.modules[f"{PACKAGE_NAME}.gemini_client"]
 
 
 def make_wav(amplitude: int, *, frames: int = 3200, sample_rate: int = 16000) -> bytes:
@@ -377,6 +394,19 @@ class PluginTests(unittest.TestCase):
             ),
             ("files", 99, False),
         )
+
+    def test_production_loader_resolves_package_relative_modules(self) -> None:
+        generated_name = f"loader_compat_{uuid4().hex}"
+        loaded = load_plugin_package(generated_name)
+        try:
+            self.assertEqual(loaded.__package__, generated_name)
+            self.assertTrue(hasattr(loaded, "create_plugin"))
+            for child_name in ("audio", "gemini_client", "gemini_transport"):
+                self.assertIn(f"{generated_name}.{child_name}", sys.modules)
+        finally:
+            for name in list(sys.modules):
+                if name == generated_name or name.startswith(f"{generated_name}."):
+                    del sys.modules[name]
 
 
 if __name__ == "__main__":

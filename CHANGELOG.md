@@ -21,7 +21,12 @@ version section before creating `v<version>`.
 - Files uploads, FFmpeg normalization, and fallback inputs now use in-memory streams where possible, avoiding unnecessary temporary files and Base64 re-encoding.
 - Raised the plugin/manifest version to `1.1.0` and documented the new audio and decoder configuration.
 
+### Fixed
+
+- Fixed real MaiBot package-style loading by changing plugin-internal imports to package-relative imports.
+- Added a regression test that loads `plugin.py` with MaiBot's `spec_from_file_location` contract and verifies all internal modules resolve.
+
 ### Validation
 
-- `pytest -q`: 15 passed.
+- `pytest -q`: 16 passed.
 - Python compilation, TOML/JSON metadata parsing, and Git whitespace checks passed.

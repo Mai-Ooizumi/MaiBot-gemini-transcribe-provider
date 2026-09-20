@@ -5,7 +5,7 @@ import inspect
 import io
 from typing import Any
 
-from audio import NormalizedAudio
+from .audio import NormalizedAudio
 
 
 TRANSPORT_STRATEGIES = {"auto", "inline", "files"}

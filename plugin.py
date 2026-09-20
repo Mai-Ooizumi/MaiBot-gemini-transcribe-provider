@@ -8,9 +8,9 @@ from typing import Any
 
 from maibot_sdk import LLMProvider, MaiBotPlugin
 
-from audio import NormalizedAudio, detect_audio, is_clearly_silent, normalize_audio
-from gemini_client import GeminiClientPool
-from gemini_transport import extract_interaction_text, interaction_diagnostic, transcribe
+from .audio import NormalizedAudio, detect_audio, is_clearly_silent, normalize_audio
+from .gemini_client import GeminiClientPool
+from .gemini_transport import extract_interaction_text, interaction_diagnostic, transcribe
 
 
 CLIENT_TYPE = "gemini35.transcribe"
@@ -257,7 +257,7 @@ def _detect_audio(data: bytes) -> tuple[str | None, str | None]:
 
 def _convert_to_wav(src: Path, dst: Path, timeout: float) -> None:
     """Compatibility wrapper for callers of the former path-based helper."""
-    from audio import _convert_with_ffmpeg
+    from .audio import _convert_with_ffmpeg
 
     dst.write_bytes(_convert_with_ffmpeg(src.read_bytes(), src.suffix, timeout))
 
